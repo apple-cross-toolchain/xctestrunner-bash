@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+
+# Exit codes (kept compatible with the Python runner).
+EXITCODE_SUCCEEDED=0
+EXITCODE_ERROR=1
+EXITCODE_UNKNOWN=10
+EXITCODE_FAILED=11
+EXITCODE_TEST_NOT_START=12
+EXITCODE_NEED_REBOOT_DEVICE=13
+EXITCODE_NEED_RECREATE_SIM=14
+EXITCODE_SIM_ERROR=15
+
+SDK_IPHONEOS='iphoneos'
+SDK_IPHONESIMULATOR='iphonesimulator'
+
+PLATFORM_IOS_DEVICE='ios_device'
+PLATFORM_IOS_SIMULATOR='ios_simulator'
+
+TEST_TYPE_XCUITEST='xcuitest'
+TEST_TYPE_XCTEST='xctest'
+TEST_TYPE_LOGIC_TEST='logic_test'
+
+TEST_STARTED_SIGNAL='Test Suite'
+XCTRUNNER_STARTED_SIGNAL='Running tests...'
+CORESIMULATOR_INTERRUPTED_ERROR='CoreSimulatorService connection interrupted'
+
+SIGNAL_TEST_WITHOUT_BUILDING_SUCCEEDED='** TEST EXECUTE SUCCEEDED **'
+SIGNAL_TEST_WITHOUT_BUILDING_FAILED='** TEST EXECUTE FAILED **'
+
+DEFAULT_XCODEBUILD_STARTUP_TIMEOUT_SEC=150
+SIM_TEST_MAX_ATTEMPTS=3
+DEVICE_TEST_MAX_ATTEMPTS=2
+
+SIMULATOR_CREATING_TO_SHUTDOWN_TIMEOUT_SEC=10
+SIMULATOR_BOOTED_TIMEOUT_SEC=30
+SIMULATOR_SHUTDOWN_TIMEOUT_SEC=30
+SIMULATOR_STATE_POLL_INTERVAL_SEC=1
+
+TOO_MANY_INSTANCES_ALREADY_RUNNING='Too many instances of this service are already running.'
+PROCESS_EXITED_OR_CRASHED_ERROR='The process did launch, but has since exited or crashed.'
+REQUEST_DENIED_ERROR='The request was denied by service delegate (SBMainWorkspace) for reason'
+INIT_SIM_SERVICE_ERROR='Failed to initiate service connection to simulator'
+DEVICE_TYPE_WAS_NULL_ERROR='DTDeviceKit: deviceType from '
+LOST_CONNECTION_ERROR='Lost connection to testmanagerd'
+LOST_CONNECTION_TO_DTSERVICEHUB_ERROR='Lost connection to DTServiceHub'
+DEVICE_NO_LONGER_CONNECTED='This device is no longer connected'
+UNABLE_FIND_DEVICE_IDENTIFIER='Unable to find device with identifier'
+BUNDLE_DAMAGED='The bundle is damaged or missing necessary resources.'
+BACKGROUND_TEST_RUNNER_ERROR='Failed to background test runner'
+
+LIB_XCTEST_SWIFT_RELATIVE_PATH='Developer/usr/lib/libXCTestSwiftSupport.dylib'

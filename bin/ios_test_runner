@@ -1,0 +1,533 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+resolve_repo_root() {
+  local candidate
+  local found
+
+  candidate="$(cd "${SCRIPT_DIR}/.." && pwd)"
+  if [ -f "${candidate}/lib/constants.sh" ]; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+
+  if [ -n "${RUNFILES_DIR:-}" ]; then
+    for candidate in \
+      "${RUNFILES_DIR}/_main" \
+      "${RUNFILES_DIR}/xctestrunner"; do
+      if [ -f "${candidate}/lib/constants.sh" ]; then
+        printf '%s\n' "$candidate"
+        return 0
+      fi
+    done
+
+    found=$(find "${RUNFILES_DIR}" -maxdepth 3 -path '*/lib/constants.sh' -print -quit 2>/dev/null || true)
+    if [ -n "$found" ]; then
+      printf '%s\n' "$(cd "$(dirname "$found")/.." && pwd)"
+      return 0
+    fi
+  fi
+
+  for candidate in \
+    "${SCRIPT_DIR}.runfiles/_main" \
+    "$0.runfiles/_main"; do
+    if [ -f "${candidate}/lib/constants.sh" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+REPO_ROOT="$(resolve_repo_root)"
+
+# shellcheck source=../lib/constants.sh
+source "${REPO_ROOT}/lib/constants.sh"
+# shellcheck source=../lib/common.sh
+source "${REPO_ROOT}/lib/common.sh"
+# shellcheck source=../lib/plist_json.sh
+source "${REPO_ROOT}/lib/plist_json.sh"
+# shellcheck source=../lib/bundle.sh
+source "${REPO_ROOT}/lib/bundle.sh"
+# shellcheck source=../lib/xcode.sh
+source "${REPO_ROOT}/lib/xcode.sh"
+# shellcheck source=../lib/simulator.sh
+source "${REPO_ROOT}/lib/simulator.sh"
+# shellcheck source=../lib/executor.sh
+source "${REPO_ROOT}/lib/executor.sh"
+# shellcheck source=../lib/xcresult.sh
+source "${REPO_ROOT}/lib/xcresult.sh"
+# shellcheck source=../lib/session.sh
+source "${REPO_ROOT}/lib/session.sh"
+
+APP_UNDER_TEST_PATH=''
+TEST_BUNDLE_PATH=''
+XCTESTRUN_PATH=''
+LAUNCH_OPTIONS_JSON_PATH=''
+SIGNING_OPTIONS_JSON_PATH=''
+TEST_TYPE=''
+WORK_DIR=''
+OUTPUT_DIR=''
+
+SUBCOMMAND=''
+
+TARGET_ID=''
+TARGET_PLATFORM=''
+TARGET_ARCH=''
+SIM_DEVICE_TYPE=''
+SIM_OS_VERSION=''
+SIM_NAME_PREFIX=''
+
+CURRENT_SIMULATOR_ID=''
+SIMULATOR_CREATED=0
+
+print_main_help() {
+  cat <<'HELP'
+Usage:
+  ios_test_runner [global-options] <subcommand> [subcommand-options]
+
+Subcommands:
+  prepare         Prepare working directory and xctestrun artifacts.
+  test            Run tests on an existing device/simulator by id.
+  simulator_test  Create a simulator, run tests, then delete it.
+
+Global options:
+  -v, --verbose
+  --app_under_test_path <path>
+  --test_bundle_path <path>
+  --xctestrun <path>
+  --launch_options_json_path <path>
+  --signing_options_json_path <path>
+  --test_type <xcuitest|xctest|logic_test>
+  --work_dir <path>
+  --output_dir <path>
+  -h, --help
+
+Run `ios_test_runner <subcommand> --help` for subcommand details.
+HELP
+}
+
+print_prepare_help() {
+  cat <<'HELP'
+Usage:
+  ios_test_runner [global-options] prepare --platform <ios_device|ios_simulator> --arch <arch>
+
+Required options:
+  --platform <ios_device|ios_simulator>
+  --arch <x86_64|armv7|arm64|arm64e>
+HELP
+}
+
+print_test_help() {
+  cat <<'HELP'
+Usage:
+  ios_test_runner [global-options] test --id <device-udid> [--platform <ios_device|ios_simulator>]
+
+Required options:
+  --id <device-udid>
+HELP
+}
+
+print_simulator_test_help() {
+  cat <<'HELP'
+Usage:
+  ios_test_runner [global-options] simulator_test [options]
+
+Options:
+  --device_type <simctl device type name>
+  --os_version <major.minor>
+  --new_simulator_name_prefix <prefix>
+HELP
+}
+
+cleanup_all() {
+  if [ "$SIMULATOR_CREATED" -eq 1 ] && [ -n "$CURRENT_SIMULATOR_ID" ]; then
+    sim_delete "$CURRENT_SIMULATOR_ID" >/dev/null 2>&1 || true
+    SIMULATOR_CREATED=0
+  fi
+  session_close >/dev/null 2>&1 || true
+  cleanup_tracked_paths
+}
+
+platform_to_sdk() {
+  local platform="$1"
+  case "$platform" in
+    "$PLATFORM_IOS_DEVICE") printf '%s\n' "$SDK_IPHONEOS" ;;
+    "$PLATFORM_IOS_SIMULATOR") printf '%s\n' "$SDK_IPHONESIMULATOR" ;;
+    *)
+      fatal "Unsupported platform ${platform}. Supported: ${PLATFORM_IOS_DEVICE}, ${PLATFORM_IOS_SIMULATOR}" || return 1
+      ;;
+  esac
+}
+
+get_sdk_from_device_id() {
+  local device_id="$1"
+  local json_file
+  local idx=0
+  local identifier
+  local simulator
+
+  json_file=$(mktemp)
+  track_temp_path "$json_file"
+
+  if ! xcrun xcdevice list >"$json_file" 2>/dev/null; then
+    printf '%s\n' ''
+    return 0
+  fi
+
+  while true; do
+    if ! json_file_has_key "$json_file" "${idx}"; then
+      break
+    fi
+    identifier=$(json_file_get_raw "$json_file" "${idx}.identifier" 2>/dev/null || true)
+    if [ "$identifier" = "$device_id" ]; then
+      simulator=$(json_file_get_raw "$json_file" "${idx}.simulator" 2>/dev/null || true)
+      case "$simulator" in
+        true|TRUE|True|YES|yes|1) printf '%s\n' "$SDK_IPHONESIMULATOR" ;;
+        *) printf '%s\n' "$SDK_IPHONEOS" ;;
+      esac
+      return 0
+    fi
+    idx=$((idx + 1))
+  done
+
+  printf '%s\n' ''
+}
+
+get_device_arch() {
+  local device_id="$1"
+  local sdk="$2"
+
+  if [ "$sdk" = "$SDK_IPHONESIMULATOR" ]; then
+    printf '%s\n' 'x86_64'
+    return 0
+  fi
+
+  if [[ "$device_id" == *-* ]]; then
+    printf '%s\n' 'arm64e'
+  else
+    printf '%s\n' 'arm64'
+  fi
+}
+
+ensure_prerequisites() {
+  require_command xcrun
+  require_command xcodebuild
+  require_command nm
+  require_command unzip
+  require_command codesign
+  require_command tail
+  ensure_plist_tools
+}
+
+parse_global_args() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -h|--help)
+        print_main_help
+        exit 0
+        ;;
+      -v|--verbose)
+        VERBOSE=1
+        shift
+        ;;
+      --app_under_test_path)
+        APP_UNDER_TEST_PATH="$2"
+        shift 2
+        ;;
+      --test_bundle_path)
+        TEST_BUNDLE_PATH="$2"
+        shift 2
+        ;;
+      --xctestrun)
+        XCTESTRUN_PATH="$2"
+        shift 2
+        ;;
+      --launch_options_json_path)
+        LAUNCH_OPTIONS_JSON_PATH="$2"
+        shift 2
+        ;;
+      --signing_options_json_path)
+        SIGNING_OPTIONS_JSON_PATH="$2"
+        shift 2
+        ;;
+      --test_type)
+        TEST_TYPE="$2"
+        shift 2
+        ;;
+      --work_dir)
+        WORK_DIR="$2"
+        shift 2
+        ;;
+      --output_dir)
+        OUTPUT_DIR="$2"
+        shift 2
+        ;;
+      prepare|test|simulator_test)
+        SUBCOMMAND="$1"
+        shift
+        SUBCOMMAND_ARGS=("$@")
+        return 0
+        ;;
+      *)
+        fatal "Unknown option: $1" || return 1
+        ;;
+    esac
+  done
+
+  fatal 'A subcommand is required: prepare, test, simulator_test' || return 1
+}
+
+parse_prepare_args() {
+  local args=("$@")
+  local i=0
+
+  TARGET_PLATFORM=''
+  TARGET_ARCH=''
+
+  while [ "$i" -lt "${#args[@]}" ]; do
+    case "${args[$i]}" in
+      -h|--help)
+        print_prepare_help
+        exit 0
+        ;;
+      --platform)
+        i=$((i + 1))
+        TARGET_PLATFORM="${args[$i]}"
+        ;;
+      --arch)
+        i=$((i + 1))
+        TARGET_ARCH="${args[$i]}"
+        ;;
+      *)
+        fatal "Unknown prepare option: ${args[$i]}" || return 1
+        ;;
+    esac
+    i=$((i + 1))
+  done
+
+  if [ -z "$TARGET_PLATFORM" ] || [ -z "$TARGET_ARCH" ]; then
+    fatal 'prepare requires --platform and --arch' || return 1
+  fi
+}
+
+parse_test_args() {
+  local args=("$@")
+  local i=0
+
+  TARGET_ID=''
+  TARGET_PLATFORM=''
+
+  while [ "$i" -lt "${#args[@]}" ]; do
+    case "${args[$i]}" in
+      -h|--help)
+        print_test_help
+        exit 0
+        ;;
+      --id)
+        i=$((i + 1))
+        TARGET_ID="${args[$i]}"
+        ;;
+      --platform)
+        i=$((i + 1))
+        TARGET_PLATFORM="${args[$i]}"
+        ;;
+      *)
+        fatal "Unknown test option: ${args[$i]}" || return 1
+        ;;
+    esac
+    i=$((i + 1))
+  done
+
+  if [ -z "$TARGET_ID" ]; then
+    fatal 'test requires --id' || return 1
+  fi
+}
+
+parse_simulator_test_args() {
+  local args=("$@")
+  local i=0
+
+  SIM_DEVICE_TYPE=''
+  SIM_OS_VERSION=''
+  SIM_NAME_PREFIX=''
+
+  while [ "$i" -lt "${#args[@]}" ]; do
+    case "${args[$i]}" in
+      -h|--help)
+        print_simulator_test_help
+        exit 0
+        ;;
+      --device_type)
+        i=$((i + 1))
+        SIM_DEVICE_TYPE="${args[$i]}"
+        ;;
+      --os_version)
+        i=$((i + 1))
+        SIM_OS_VERSION="${args[$i]}"
+        ;;
+      --new_simulator_name_prefix)
+        i=$((i + 1))
+        SIM_NAME_PREFIX="${args[$i]}"
+        ;;
+      *)
+        fatal "Unknown simulator_test option: ${args[$i]}" || return 1
+        ;;
+    esac
+    i=$((i + 1))
+  done
+}
+
+run_prepare() {
+  local sdk
+
+  parse_prepare_args "${SUBCOMMAND_ARGS[@]}"
+  ensure_prerequisites
+  sdk=$(platform_to_sdk "$TARGET_PLATFORM") || return 1
+
+  session_init "$sdk" "$TARGET_ARCH" "$WORK_DIR" "$OUTPUT_DIR"
+  session_prepare \
+    "$APP_UNDER_TEST_PATH" \
+    "$TEST_BUNDLE_PATH" \
+    "$XCTESTRUN_PATH" \
+    "$TEST_TYPE" \
+    "$SIGNING_OPTIONS_JSON_PATH"
+  session_set_launch_options "$LAUNCH_OPTIONS_JSON_PATH"
+
+  return "$EXITCODE_SUCCEEDED"
+}
+
+run_test() {
+  local sdk
+  local device_arch
+
+  parse_test_args "${SUBCOMMAND_ARGS[@]}"
+  ensure_prerequisites
+
+  if [ -n "$TARGET_PLATFORM" ]; then
+    sdk=$(platform_to_sdk "$TARGET_PLATFORM") || return 1
+  else
+    sdk=$(get_sdk_from_device_id "$TARGET_ID")
+    if [ -z "$sdk" ]; then
+      fatal "Could not determine SDK for device id ${TARGET_ID}" || return 1
+    fi
+  fi
+
+  device_arch=$(get_device_arch "$TARGET_ID" "$sdk")
+
+  session_init "$sdk" "$device_arch" "$WORK_DIR" "$OUTPUT_DIR"
+  session_prepare \
+    "$APP_UNDER_TEST_PATH" \
+    "$TEST_BUNDLE_PATH" \
+    "$XCTESTRUN_PATH" \
+    "$TEST_TYPE" \
+    "$SIGNING_OPTIONS_JSON_PATH"
+  session_set_launch_options "$LAUNCH_OPTIONS_JSON_PATH"
+  local exit_code
+  set +e
+  session_run_test "$TARGET_ID"
+  exit_code=$?
+  set -e
+  return "$exit_code"
+}
+
+run_simulator_test() {
+  local sim_info
+  local sdk="$SDK_IPHONESIMULATOR"
+  local device_arch='x86_64'
+  local hostless=0
+  local exit_code
+
+  parse_simulator_test_args "${SUBCOMMAND_ARGS[@]}"
+  ensure_prerequisites
+
+  set +e
+  sim_info=$(sim_create_new_simulator "$SIM_DEVICE_TYPE" "$SIM_OS_VERSION" "$SIM_NAME_PREFIX")
+  if [ "$?" -ne 0 ]; then
+    set -e
+    return "$EXITCODE_SIM_ERROR"
+  fi
+  set -e
+
+  CURRENT_SIMULATOR_ID="${sim_info%%|*}"
+  SIMULATOR_CREATED=1
+
+  local remainder
+  local os_version
+  remainder="${sim_info#*|}"
+  remainder="${remainder#*|}"
+  os_version="${remainder%%|*}"
+
+  session_init "$sdk" "$device_arch" "$WORK_DIR" "$OUTPUT_DIR"
+
+  if [ -z "$APP_UNDER_TEST_PATH" ]; then
+    hostless=1
+  fi
+
+  if [ "$hostless" -eq 0 ]; then
+    if ! sim_boot "$CURRENT_SIMULATOR_ID"; then
+      return "$EXITCODE_SIM_ERROR"
+    fi
+  fi
+
+  session_prepare \
+    "$APP_UNDER_TEST_PATH" \
+    "$TEST_BUNDLE_PATH" \
+    "$XCTESTRUN_PATH" \
+    "$TEST_TYPE" \
+    "$SIGNING_OPTIONS_JSON_PATH"
+  session_set_launch_options "$LAUNCH_OPTIONS_JSON_PATH"
+
+  if [ "$hostless" -eq 0 ]; then
+    if ! sim_boot_status_wait "$CURRENT_SIMULATOR_ID" 60; then
+      log_warn "Simulator ${CURRENT_SIMULATOR_ID} did not boot within 60s; running test anyway."
+    fi
+  fi
+
+  set +e
+  session_run_test "$CURRENT_SIMULATOR_ID" "$os_version"
+  exit_code=$?
+  set -e
+
+  sim_delete "$CURRENT_SIMULATOR_ID" >/dev/null 2>&1 || true
+  SIMULATOR_CREATED=0
+  CURRENT_SIMULATOR_ID=''
+
+  return "$exit_code"
+}
+
+main() {
+  local exit_code
+
+  trap cleanup_all EXIT
+
+  parse_global_args "$@"
+
+  set +e
+  case "$SUBCOMMAND" in
+    prepare)
+      run_prepare
+      exit_code=$?
+      ;;
+    test)
+      run_test
+      exit_code=$?
+      ;;
+    simulator_test)
+      run_simulator_test
+      exit_code=$?
+      ;;
+    *)
+      fatal "Unknown subcommand: ${SUBCOMMAND}" || return 1
+      ;;
+  esac
+  set -e
+
+  log_info 'Done.'
+  return "$exit_code"
+}
+
+main "$@"
