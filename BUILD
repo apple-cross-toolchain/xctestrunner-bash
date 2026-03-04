@@ -8,6 +8,11 @@ sh_executable(
     data = glob(["lib/*.sh"]),
 )
 
+sh_executable(
+    name = "simulator_creator",
+    src = "bin/simulator_creator",
+)
+
 filegroup(
     name = "for_bazel_tests",
     testonly = 1,

@@ -1,0 +1,250 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+usage() {
+  cat <<EOF
+usage: $(basename "$0") [-h] [--os_version OS_VERSION] [--device_type DEVICE_TYPE] [--name NAME] [--reuse-simulator | --no-reuse-simulator]
+EOF
+}
+
+parser_error() {
+  usage >&2
+  echo "$(basename "$0"): error: $1" >&2
+  exit 2
+}
+
+simctl() {
+  xcrun simctl "$@"
+}
+
+trim() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+random_suffix() {
+  local chars='abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+  local suffix=""
+  local index
+  local i
+  for ((i = 0; i < 8; i++)); do
+    index=$((RANDOM % ${#chars}))
+    suffix+="${chars:index:1}"
+  done
+  printf '%s' "$suffix"
+}
+
+device_name() {
+  local device_type="$1"
+  local os_version="$2"
+  printf 'BAZEL_TEST_%s_%s' "$device_type" "$os_version"
+}
+
+find_device_by_name_in_runtime() {
+  local runtime_identifier="$1"
+  local expected_name="$2"
+  simctl list devices "$runtime_identifier" | \
+    awk -v target="$expected_name" '
+      {
+        line = $0
+        split(line, parts, "(")
+        if (length(parts) < 3) {
+          next
+        }
+        name = parts[1]
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", name)
+        if (name != target) {
+          next
+        }
+        udid = parts[2]
+        sub(/\).*/, "", udid)
+        state = parts[3]
+        sub(/\).*/, "", state)
+        printf("%s\t%s\t%s\n", udid, tolower(state), name)
+        found = 1
+        exit 0
+      }
+      END { if (!found) exit 1 }
+    '
+}
+
+find_device_by_udid() {
+  local simulator_id="$1"
+  simctl list devices "$simulator_id" | \
+    awk -v target="$simulator_id" '
+      {
+        line = $0
+        split(line, parts, "(")
+        if (length(parts) < 3) {
+          next
+        }
+        udid = parts[2]
+        sub(/\).*/, "", udid)
+        if (udid != target) {
+          next
+        }
+        name = parts[1]
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", name)
+        state = parts[3]
+        sub(/\).*/, "", state)
+        printf("%s\t%s\n", name, tolower(state))
+        found = 1
+        exit 0
+      }
+      END { if (!found) exit 1 }
+    '
+}
+
+boot_simulator() {
+  local simulator_id="$1"
+  local output=""
+  local exit_code=0
+  set +e
+  output="$(simctl bootstatus "$simulator_id" -b)"
+  exit_code=$?
+  set -e
+
+  if [[ "$exit_code" -eq 0 ]]; then
+    echo "$output" >&2
+  else
+    if [[ "$exit_code" -eq 149 ]]; then
+      local device_blob
+      if device_blob="$(find_device_by_udid "$simulator_id")"; then
+        local existing_name
+        local existing_state
+        IFS=$'\t' read -r existing_name existing_state <<< "$device_blob"
+        if [[ "$existing_state" == "booted" ]]; then
+          echo "Simulator '$existing_name' ($simulator_id) is already booted" >&2
+          exit_code=0
+        fi
+      fi
+    fi
+
+    if [[ "$exit_code" -eq 164 || "$exit_code" -eq 165 ]]; then
+      echo "Ignoring 'simctl bootstatus' exit code $exit_code" >&2
+    elif [[ "$exit_code" -ne 0 ]]; then
+      echo "'simctl bootstatus' exit code $exit_code" >&2
+      return "$exit_code"
+    fi
+  fi
+
+  # Add more arbitrary delay before tests run. Even bootstatus doesn't wait
+  # long enough and tests can still fail because the simulator isn't ready
+  sleep 3
+}
+
+create_and_boot_simulator() {
+  local os_version="$1"
+  local device_type="$2"
+  local name="${3:-}"
+  local reuse_simulator="$4"
+
+  local target_name
+  target_name="$(device_name "$device_type" "$os_version")"
+  if [[ -n "$name" ]]; then
+    target_name="$name"
+  fi
+
+  local runtime_identifier="com.apple.CoreSimulator.SimRuntime.iOS-${os_version//./-}"
+  local existing_device=""
+
+  if [[ "$reuse_simulator" == true ]]; then
+    if existing_device="$(find_device_by_name_in_runtime "$runtime_identifier" "$target_name")"; then
+      true
+    fi
+  fi
+
+  local simulator_id
+  if [[ -n "$existing_device" ]]; then
+    local state
+    local existing_name
+    IFS=$'\t' read -r simulator_id state existing_name <<< "$existing_device"
+    echo "Existing simulator '$existing_name' ($simulator_id) state is: $state" >&2
+    if [[ "$state" != "booted" ]]; then
+      boot_simulator "$simulator_id"
+    fi
+  else
+    if [[ "$reuse_simulator" != true ]]; then
+      target_name+="_$(random_suffix)"
+    fi
+    simulator_id="$(trim "$(simctl create "$target_name" "$device_type" "$runtime_identifier")")"
+    echo "Created new simulator '$target_name' ($simulator_id)" >&2
+    boot_simulator "$simulator_id"
+  fi
+
+  trim "$simulator_id"
+}
+
+os_version_arg=""
+device_type_arg=""
+simulator_name=""
+reuse_simulator_arg=true
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --os_version)
+      [[ $# -ge 2 ]] || parser_error "argument --os_version: expected one argument"
+      os_version_arg="$2"
+      shift 2
+      ;;
+    --os_version=*)
+      os_version_arg="${1#*=}"
+      shift
+      ;;
+    --device_type)
+      [[ $# -ge 2 ]] || parser_error "argument --device_type: expected one argument"
+      device_type_arg="$2"
+      shift 2
+      ;;
+    --device_type=*)
+      device_type_arg="${1#*=}"
+      shift
+      ;;
+    --name)
+      [[ $# -ge 2 ]] || parser_error "argument --name: expected one argument"
+      simulator_name="$2"
+      shift 2
+      ;;
+    --name=*)
+      simulator_name="${1#*=}"
+      shift
+      ;;
+    --reuse-simulator)
+      reuse_simulator_arg=true
+      shift
+      ;;
+    --no-reuse-simulator)
+      reuse_simulator_arg=false
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      parser_error "unrecognized arguments: $1"
+      ;;
+  esac
+done
+
+os_version="${os_version_arg:-${SIMULATOR_OS_VERSION:-}}"
+device_type="${device_type_arg:-${SIMULATOR_DEVICE_TYPE:-}}"
+
+if [[ "$reuse_simulator_arg" == true || -n "${SIMULATOR_REUSE_SIMULATOR+x}" ]]; then
+  reuse_simulator=true
+else
+  reuse_simulator=false
+fi
+
+if [[ -z "$os_version" ]]; then
+  parser_error "OS version must be provided either as an argument or through the SIMULATOR_OS_VERSION environment variable"
+fi
+if [[ -z "$device_type" ]]; then
+  parser_error "Device type must be provided either as an argument or through the SIMULATOR_DEVICE_TYPE environment variable"
+fi
+
+simulator_id="$(create_and_boot_simulator "$os_version" "$device_type" "$simulator_name" "$reuse_simulator")"
+echo "$(trim "$simulator_id")"
