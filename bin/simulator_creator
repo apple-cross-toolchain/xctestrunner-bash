@@ -225,7 +225,14 @@ while [[ $# -gt 0 ]]; do
       exit 0
       ;;
     *)
-      parser_error "unrecognized arguments: $1"
+      if [[ -z "$os_version_arg" ]]; then
+        os_version_arg="$1"
+      elif [[ -z "$device_type_arg" ]]; then
+        device_type_arg="$1"
+      else
+        parser_error "unrecognized arguments: $1"
+      fi
+      shift
       ;;
   esac
 done
