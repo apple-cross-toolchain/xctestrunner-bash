@@ -237,7 +237,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-os_version="${os_version_arg:-${SIMULATOR_OS_VERSION:-}}"
+os_version="${os_version_arg:-${SIMULATOR_OS_VERSION:-${SIMULATOR_SDK_VERSION:-}}}"
 device_type="${device_type_arg:-${SIMULATOR_DEVICE_TYPE:-}}"
 
 if [[ "$reuse_simulator_arg" == true || -n "${SIMULATOR_REUSE_SIMULATOR+x}" ]]; then
@@ -247,7 +247,7 @@ else
 fi
 
 if [[ -z "$os_version" ]]; then
-  parser_error "OS version must be provided either as an argument or through the SIMULATOR_OS_VERSION environment variable"
+  parser_error "OS version must be provided either as an argument or through the SIMULATOR_OS_VERSION or SIMULATOR_SDK_VERSION environment variable"
 fi
 if [[ -z "$device_type" ]]; then
   parser_error "Device type must be provided either as an argument or through the SIMULATOR_DEVICE_TYPE environment variable"
